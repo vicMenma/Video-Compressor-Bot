@@ -1,251 +1,245 @@
-# compressor.py
-import os
+# utils/compressor.py
 import asyncio
+import os
+import re
 import subprocess
-import json
-import time
-from typing import Dict, Any, Callable, Optional
-from PIL import Image
-import aiofiles
+from typing import Dict, Optional, Callable
+from bot.config import Config
 
 class VideoCompressor:
     def __init__(self):
-        self.active_processes = {}
+        self.ffmpeg_path = "ffmpeg"
     
-    async def get_video_info(self, file_path: str) -> Dict[str, Any]:
-        """Get video information using ffprobe"""
-        cmd = [
-            'ffprobe', '-v', 'quiet', '-print_format', 'json',
-            '-show_format', '-show_streams', file_path
-        ]
-        
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode == 0:
-                info = json.loads(stdout.decode())
-                
-                # Extract video stream info
-                video_stream = None
-                audio_stream = None
-                
-                for stream in info.get('streams', []):
-                    if stream.get('codec_type') == 'video' and not video_stream:
-                        video_stream = stream
-                    elif stream.get('codec_type') == 'audio' and not audio_stream:
-                        audio_stream = stream
-                
-                return {
-                    'duration': float(info['format'].get('duration', 0)),
-                    'size': int(info['format'].get('size', 0)),
-                    'bitrate': int(info['format'].get('bit_rate', 0)),
-                    'format': info['format'].get('format_name', ''),
-                    'video': {
-                        'codec': video_stream.get('codec_name', '') if video_stream else '',
-                        'width': int(video_stream.get('width', 0)) if video_stream else 0,
-                        'height': int(video_stream.get('height', 0)) if video_stream else 0,
-                        'fps': eval(video_stream.get('r_frame_rate', '0/1')) if video_stream else 0,
-                        'bitrate': int(video_stream.get('bit_rate', 0)) if video_stream else 0
-                    },
-                    'audio': {
-                        'codec': audio_stream.get('codec_name', '') if audio_stream else '',
-                        'bitrate': int(audio_stream.get('bit_rate', 0)) if audio_stream else 0,
-                        'sample_rate': int(audio_stream.get('sample_rate', 0)) if audio_stream else 0,
-                        'channels': int(audio_stream.get('channels', 0)) if audio_stream else 0
-                    } if audio_stream else None
-                }
-        except Exception as e:
-            print(f"Error getting video info: {e}")
-            return {}
-    
-    async def generate_thumbnail(self, video_path: str, output_path: str, 
-                               timestamp: float = None) -> bool:
-        """Generate video thumbnail"""
-        try:
-            if timestamp is None:
-                # Get duration and use middle frame
-                info = await self.get_video_info(video_path)
-                timestamp = info.get('duration', 0) / 2
-            
-            cmd = [
-                'ffmpeg', '-i', video_path, '-ss', str(timestamp),
-                '-vframes', '1', '-q:v', '2', '-y', output_path
-            ]
-            
-            process = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            await process.communicate()
-            
-            if process.returncode == 0 and os.path.exists(output_path):
-                # Resize thumbnail to reasonable size
-                with Image.open(output_path) as img:
-                    img.thumbnail((320, 320), Image.Resampling.LANCZOS)
-                    img.save(output_path)
-                return True
-                
-        except Exception as e:
-            print(f"Error generating thumbnail: {e}")
-        
-        return False
-    
-    async def compress_video(self, input_path: str, output_path: str,
-                           settings: Dict[str, Any], task_id: str,
-                           progress_callback: Optional[Callable] = None) -> Dict[str, Any]:
+    async def compress_video(
+        self, 
+        input_path: str, 
+        output_path: str, 
+        settings: Dict, 
+        progress_callback: Optional[Callable] = None
+    ) -> bool:
         """Compress video with given settings"""
-        
-        # Get video info
-        video_info = await self.get_video_info(input_path)
-        if not video_info:
-            return {'success': False, 'error': 'Could not analyze video'}
-        
-        # Build FFmpeg command
-        cmd = ['ffmpeg', '-i', input_path]
-        
-        # Video codec and quality
-        preset = settings.get('preset', 'medium')
-        crf = settings.get('crf', '24')
-        
-        cmd.extend(['-c:v', 'libx264', '-preset', preset, '-crf', crf])
-        
-        # Resolution
-        resolution = settings.get('resolution', 'keep')
-        if resolution != 'keep' and resolution in ['240p', '360p', '480p', '720p', '1080p']:
-            resolution_map = {
-                '240p': '426:240',
-                '360p': '640:360', 
-                '480p': '854:480',
-                '720p': '1280:720',
-                '1080p': '1920:1080'
-            }
-            cmd.extend(['-vf', f'scale={resolution_map[resolution]}'])
-        
-        # Video bitrate
-        video_bitrate = settings.get('video_bitrate')
-        if video_bitrate and video_bitrate != 'auto':
-            cmd.extend(['-b:v', video_bitrate])
-        
-        # Audio settings
-        if settings.get('remove_audio', False):
-            cmd.extend(['-an'])
-        else:
-            cmd.extend(['-c:a', 'aac'])
-            audio_bitrate = settings.get('audio_bitrate', '128k')
-            cmd.extend(['-b:a', audio_bitrate])
-        
-        # Output settings
-        cmd.extend(['-movflags', '+faststart', '-y', output_path])
-        
-        # Start compression
-        start_time = time.time()
-        
         try:
+            # Build FFmpeg command
+            cmd = await self._build_ffmpeg_command(input_path, output_path, settings)
+            
+            print(f"FFmpeg command: {' '.join(cmd)}")
+            
+            # Get video duration for progress calculation
+            duration = await self._get_video_duration(input_path)
+            
+            # Start compression process
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
             
-            self.active_processes[task_id] = process
-            
             # Monitor progress
-            if progress_callback:
-                asyncio.create_task(
-                    self._monitor_progress(process, video_info['duration'], 
-                                         progress_callback, task_id)
-                )
+            if progress_callback and duration > 0:
+                await self._monitor_progress(process, duration, progress_callback)
             
+            # Wait for completion
             stdout, stderr = await process.communicate()
             
-            # Remove from active processes
-            if task_id in self.active_processes:
-                del self.active_processes[task_id]
-            
             if process.returncode == 0:
-                # Get output file info
-                output_info = await self.get_video_info(output_path)
-                compression_time = time.time() - start_time
-                
-                original_size = video_info.get('size', 0)
-                compressed_size = output_info.get('size', 0)
-                size_reduction = original_size - compressed_size
-                compression_ratio = (size_reduction / original_size * 100) if original_size > 0 else 0
-                
-                return {
-                    'success': True,
-                    'original_size': original_size,
-                    'compressed_size': compressed_size,
-                    'size_reduction': size_reduction,
-                    'compression_ratio': compression_ratio,
-                    'compression_time': compression_time,
-                    'output_info': output_info
-                }
+                print("Compression completed successfully")
+                return True
             else:
-                error_msg = stderr.decode() if stderr else 'Unknown compression error'
-                return {'success': False, 'error': error_msg}
+                print(f"Compression failed: {stderr.decode()}")
+                return False
                 
         except Exception as e:
-            if task_id in self.active_processes:
-                del self.active_processes[task_id]
-            return {'success': False, 'error': str(e)}
+            print(f"Compression error: {e}")
+            return False
     
-    async def _monitor_progress(self, process, duration, callback, task_id):
+    async def _build_ffmpeg_command(self, input_path: str, output_path: str, settings: Dict) -> list:
+        """Build FFmpeg command based on settings"""
+        cmd = [self.ffmpeg_path, "-i", input_path]
+        
+        # Video codec
+        cmd.extend(["-c:v", "libx264"])
+        
+        # Compression preset
+        preset = settings.get('preset', 'medium')
+        cmd.extend(["-preset", preset])
+        
+        # Video bitrate
+        video_bitrate = settings.get('video_bitrate', '2000k')
+        cmd.extend(["-b:v", video_bitrate])
+        
+        # Resolution
+        resolution = settings.get('resolution', 'keep')
+        if resolution != 'keep':
+            if resolution == '720p':
+                cmd.extend(["-vf", "scale=1280:720"])
+            elif resolution == '480p':
+                cmd.extend(["-vf", "scale=854:480"])
+            elif resolution == '360p':
+                cmd.extend(["-vf", "scale=640:360"])
+        
+        # Audio settings
+        if settings.get('remove_audio', False):
+            cmd.extend(["-an"])  # Remove audio
+        else:
+            cmd.extend(["-c:a", "aac"])
+            audio_bitrate = settings.get('audio_bitrate', '128k')
+            cmd.extend(["-b:a", audio_bitrate])
+        
+        # Output settings
+        cmd.extend(["-movflags", "+faststart"])  # Enable streaming
+        cmd.extend(["-y"])  # Overwrite output file
+        cmd.append(output_path)
+        
+        return cmd
+    
+    async def _get_video_duration(self, input_path: str) -> float:
+        """Get video duration in seconds"""
+        try:
+            cmd = [
+                "ffprobe", "-v", "quiet", "-show_entries", 
+                "format=duration", "-of", "csv=p=0", input_path
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout, _ = await process.communicate()
+            
+            if process.returncode == 0:
+                duration_str = stdout.decode().strip()
+                return float(duration_str)
+            
+        except Exception as e:
+            print(f"Error getting duration: {e}")
+        
+        return 0.0
+    
+    async def _monitor_progress(self, process, total_duration: float, progress_callback: Callable):
         """Monitor FFmpeg progress"""
         try:
             while process.returncode is None:
-                if process.stderr:
-                    line = await process.stderr.readline()
-                    if line:
-                        line = line.decode().strip()
-                        if 'time=' in line:
-                            # Extract time progress
-                            time_str = line.split('time=')[1].split(' ')[0]
-                            try:
-                                time_parts = time_str.split(':')
-                                current_seconds = (float(time_parts[0]) * 3600 + 
-                                                 float(time_parts[1]) * 60 + 
-                                                 float(time_parts[2]))
-                                
-                                progress = min(100, (current_seconds / duration) * 100)
-                                await callback(task_id, int(progress))
-                            except:
-                                pass
-                
-                await asyncio.sleep(1)
-                
+                try:
+                    # Check if process is still running
+                    if process.stderr.at_eof():
+                        break
+                    
+                    # Read stderr line
+                    line = await asyncio.wait_for(
+                        process.stderr.readline(), 
+                        timeout=1.0
+                    )
+                    
+                    if not line:
+                        continue
+                    
+                    line = line.decode().strip()
+                    
+                    # Parse time from FFmpeg output
+                    time_match = re.search(r'time=(\d+):(\d+):(\d+\.\d+)', line)
+                    if time_match:
+                        hours = int(time_match.group(1))
+                        minutes = int(time_match.group(2))
+                        seconds = float(time_match.group(3))
+                        
+                        current_time = hours * 3600 + minutes * 60 + seconds
+                        progress = (current_time / total_duration) * 100
+                        
+                        # Call progress callback
+                        await progress_callback(min(progress, 99))
+                        
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    print(f"Progress monitoring error: {e}")
+                    break
+                    
         except Exception as e:
             print(f"Progress monitoring error: {e}")
     
-    async def cancel_compression(self, task_id: str) -> bool:
-        """Cancel active compression"""
-        if task_id in self.active_processes:
-            try:
-                process = self.active_processes[task_id]
-                process.terminate()
-                await asyncio.sleep(2)
+    async def get_video_info(self, file_path: str) -> Dict:
+        """Get detailed video information"""
+        try:
+            cmd = [
+                "ffprobe", "-v", "quiet", "-print_format", "json",
+                "-show_format", "-show_streams", file_path
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode == 0:
+                import json
+                info = json.loads(stdout.decode())
+                return self._parse_video_info(info)
+            else:
+                print(f"FFprobe error: {stderr.decode()}")
                 
-                if process.returncode is None:
-                    process.kill()
-                
-                del self.active_processes[task_id]
-                return True
-            except Exception as e:
-                print(f"Error canceling compression: {e}")
+        except Exception as e:
+            print(f"Error getting video info: {e}")
         
-        return False
+        return {}
     
-    def get_format_info(self, file_path: str) -> Dict[str, str]:
-        """Get basic format information"""
-        name, ext = os.path.splitext(os.path.basename(file_path))
+    def _parse_video_info(self, ffprobe_output: Dict) -> Dict:
+        """Parse FFprobe output into readable format"""
+        info = {}
         
-        return {
-            'name': name,
-            'extension': ext.lower(),
-            'size': os.path.getsize(file_path) if os.path.exists(file_path) else 0
-        }
+        try:
+            # Format information
+            format_info = ffprobe_output.get('format', {})
+            info['duration'] = float(format_info.get('duration', 0))
+            info['size'] = int(format_info.get('size', 0))
+            info['bitrate'] = int(format_info.get('bit_rate', 0))
+            info['format_name'] = format_info.get('format_name', 'Unknown')
+            
+            # Stream information
+            streams = ffprobe_output.get('streams', [])
+            
+            for stream in streams:
+                if stream.get('codec_type') == 'video':
+                    info['width'] = stream.get('width', 0)
+                    info['height'] = stream.get('height', 0)
+                    info['fps'] = eval(stream.get('r_frame_rate', '0/1'))
+                    info['video_codec'] = stream.get('codec_name', 'Unknown')
+                    info['video_bitrate'] = int(stream.get('bit_rate', 0))
+                    
+                elif stream.get('codec_type') == 'audio':
+                    info['audio_codec'] = stream.get('codec_name', 'Unknown')
+                    info['audio_bitrate'] = int(stream.get('bit_rate', 0))
+                    info['sample_rate'] = int(stream.get('sample_rate', 0))
+                    info['channels'] = stream.get('channels', 0)
+            
+        except Exception as e:
+            print(f"Error parsing video info: {e}")
+        
+        return info
+    
+    async def generate_thumbnail(self, input_path: str, output_path: str, time_offset: str = "00:00:01") -> bool:
+        """Generate thumbnail from video"""
+        try:
+            cmd = [
+                self.ffmpeg_path, "-i", input_path,
+                "-ss", time_offset, "-vframes", "1",
+                "-q:v", "2", "-y", output_path
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            await process.communicate()
+            
+            return process.returncode == 0
+            
+        except Exception as e:
+            print(f"Thumbnail generation error: {e}")
+            return False
