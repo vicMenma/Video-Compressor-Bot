@@ -1,0 +1,12 @@
+pyrogram==2.0.106
+tgcrypto==1.2.5
+Pillow==10.0.1
+psutil==5.9.6
+aiofiles==23.2.1
+python-dotenv==1.0.0
+humanfriendly==10.0
+motor==3.3.2
+dnspython==2.4.2
+pyromod==1.5
+asyncio-throttle==1.0.2
+aiohttp==3.8.6
