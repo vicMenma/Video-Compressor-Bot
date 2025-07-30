@@ -1,7 +1,8 @@
-# video.py
+# plugins/video.py
 import os
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.handlers import MessageHandler
 from bot.config import Config
 from bot.database import Database
 from utils.helpers import format_bytes, format_duration
@@ -15,8 +16,7 @@ def auth_filter(_, __, message):
 
 auth_user = filters.create(auth_filter)
 
-@Client.on_message(filters.video & auth_user)
-async def handle_video(client: Client, message: Message):
+async def handle_video_handler(client: Client, message: Message):
     """Handle video files"""
     # Check file size
     if message.video.file_size > Config.MAX_FILE_SIZE:
@@ -62,8 +62,7 @@ Choose compression option:
     
     await message.reply_text(file_info, reply_markup=keyboard)
 
-@Client.on_message(filters.document & auth_user)
-async def handle_document(client: Client, message: Message):
+async def handle_document_handler(client: Client, message: Message):
     """Handle video documents"""
     if not message.document.file_name:
         return
@@ -111,3 +110,7 @@ Choose compression option:
     """
     
     await message.reply_text(file_info, reply_markup=keyboard)
+
+# Create handlers
+handle_video = MessageHandler(handle_video_handler, filters.video & auth_user)
+handle_document = MessageHandler(handle_document_handler, filters.document & auth_user)
