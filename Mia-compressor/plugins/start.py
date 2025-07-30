@@ -1,7 +1,8 @@
-# start.py
+# plugins/start.py
 from datetime import datetime
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.handlers import MessageHandler
 from bot.config import Config
 from bot.database import Database
 
@@ -14,8 +15,7 @@ def auth_filter(_, __, message):
 
 auth_user = filters.create(auth_filter)
 
-@Client.on_message(filters.command("start") & auth_user)
-async def start_command(client: Client, message: Message):
+async def start_command_handler(client: Client, message: Message):
     """Handle /start command"""
     user_data = {
         'first_name': message.from_user.first_name,
@@ -34,11 +34,14 @@ async def start_command(client: Client, message: Message):
     
     await message.reply_text(Config.START_MSG, reply_markup=keyboard)
 
-@Client.on_message(filters.command("help") & auth_user)
-async def help_command(client: Client, message: Message):
+async def help_command_handler(client: Client, message: Message):
     """Handle /help command"""
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔙 Back", callback_data="start")]
     ])
     
     await message.reply_text(Config.HELP_MSG, reply_markup=keyboard)
+
+# Create handlers
+start_command = MessageHandler(start_command_handler, filters.command("start") & auth_user)
+help_command = MessageHandler(help_command_handler, filters.command("help") & auth_user)
