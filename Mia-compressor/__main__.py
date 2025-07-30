@@ -47,6 +47,10 @@ class VideoCompressorBot:
             # Create necessary directories
             Config.create_directories()
             
+            # Ensure plugins directory exists
+            plugins_dir = project_root / "plugins"
+            plugins_dir.mkdir(exist_ok=True)
+            
             # Check FFmpeg availability
             if not await check_ffmpeg():
                 logger.error("❌ FFmpeg not found. Please install FFmpeg.")
@@ -56,7 +60,7 @@ class VideoCompressorBot:
             self.db = Database()
             await self.db.connect()
             
-            # Initialize Pyrogram client
+            # Initialize Pyrogram client with proper plugin configuration
             self.app = Client(
                 name="VideoCompressorBot",
                 api_id=Config.API_ID,
@@ -66,12 +70,37 @@ class VideoCompressorBot:
                 workdir=str(project_root)
             )
             
+            # Register handlers manually if plugins don't load automatically
+            await self.register_handlers()
+            
             logger.info("✅ Bot components initialized successfully")
             return True
             
         except Exception as e:
             logger.error(f"❌ Failed to initialize bot: {e}")
             return False
+    
+    async def register_handlers(self):
+        """Register handlers manually"""
+        try:
+            # Import and register handlers from plugins
+            from plugins.start import start_command, help_command
+            from plugins.video import handle_video, handle_document
+            from plugins.callbacks import handle_callback
+            
+            # Register the handlers
+            self.app.add_handler(start_command)
+            self.app.add_handler(help_command)
+            self.app.add_handler(handle_video)
+            self.app.add_handler(handle_document)
+            self.app.add_handler(handle_callback)
+            
+            logger.info("✅ Handlers registered successfully")
+            
+        except ImportError as e:
+            logger.warning(f"⚠️ Could not import some handlers: {e}")
+        except Exception as e:
+            logger.error(f"❌ Error registering handlers: {e}")
     
     async def start(self):
         """Start the bot"""
@@ -104,7 +133,7 @@ class VideoCompressorBot:
 • Queue management
 • Statistics tracking
 
-Ready to compress videos!
+Ready to compress videos! Send /start to begin.
 """
                 await self.app.send_message(Config.USER_ID, startup_msg)
             except Exception as e:
