@@ -1,12 +1,17 @@
-# callbacks.py
+# plugins/callbacks.py
+import asyncio
+import os
 from pyrogram import Client, filters
 from pyrogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.handlers import CallbackQueryHandler
 from bot.config import Config
 from bot.database import Database
 from utils.helpers import format_bytes
+from utils.compressor import VideoCompressor
 
 # Initialize components
 db = Database()
+compressor = VideoCompressor()
 
 # User authentication filter
 def auth_filter(_, __, callback_query):
@@ -14,7 +19,6 @@ def auth_filter(_, __, callback_query):
 
 auth_user = filters.create(auth_filter)
 
-@Client.on_callback_query(auth_user)
 async def handle_callback(client: Client, callback_query: CallbackQuery):
     """Handle callback queries"""
     data = callback_query.data
@@ -33,9 +37,9 @@ async def handle_callback(client: Client, callback_query: CallbackQuery):
         elif data.startswith("set_"):
             await handle_setting_change(callback_query, data)
         elif data.startswith("compress_"):
-            await handle_compression_request(callback_query, data)
+            await handle_compression_request(client, callback_query, data)
         elif data.startswith("video_info_"):
-            await show_video_info(callback_query, data)
+            await show_video_info(client, callback_query, data)
         elif data.startswith("preset_"):
             await handle_preset_selection(callback_query, data)
         elif data.startswith("resolution_"):
@@ -318,12 +322,242 @@ async def toggle_audio_setting(callback_query: CallbackQuery):
     await callback_query.answer(f"✅ Remove audio {'enabled' if new_value else 'disabled'}")
     await show_settings_menu(callback_query)
 
-async def handle_compression_request(callback_query: CallbackQuery, data: str):
+async def handle_compression_request(client: Client, callback_query: CallbackQuery, data: str):
     """Handle compression requests"""
-    await callback_query.answer("🔄 Starting compression...")
-    # Add your compression logic here
+    try:
+        parts = data.split("_")
+        compression_type = parts[1]  # quick or custom
+        message_id = int(parts[2])
+        
+        await callback_query.answer("🔄 Starting compression...")
+        
+        # Get the original message
+        try:
+            original_message = await client.get_messages(
+                callback_query.message.chat.id, 
+                message_id
+            )
+        except:
+            await callback_query.edit_message_text("❌ Original message not found.")
+            return
+        
+        # Get file info
+        if original_message.video:
+            file_obj = original_message.video
+            file_name = file_obj.file_name or f"video_{message_id}.mp4"
+        elif original_message.document:
+            file_obj = original_message.document
+            file_name = file_obj.file_name
+        else:
+            await callback_query.edit_message_text("❌ No video found in the message.")
+            return
+        
+        # Get user settings
+        user = await db.get_user(callback_query.from_user.id)
+        settings = user.get('settings', {}) if user else {}
+        
+        # Create compression task
+        task_id = f"{callback_query.from_user.id}_{message_id}_{int(asyncio.get_event_loop().time())}"
+        
+        task_data = {
+            'user_id': callback_query.from_user.id,
+            'message_id': message_id,
+            'file_name': file_name,
+            'file_size': file_obj.file_size,
+            'status': 'queued',
+            'progress': 0,
+            'settings': settings if compression_type == 'custom' else {'preset': 'medium'},
+            'created_at': asyncio.get_event_loop().time()
+        }
+        
+        # Add to queue
+        await db.add_compression_task(task_id, task_data)
+        
+        # Start compression
+        asyncio.create_task(start_compression(client, task_id, original_message, task_data))
+        
+        # Update message
+        await callback_query.edit_message_text(
+            f"✅ **Compression Started!**\n\n"
+            f"**File:** `{file_name}`\n"
+            f"**Task ID:** `{task_id}`\n"
+            f"**Status:** Queued\n\n"
+            f"You can check progress in /queue"
+        )
+        
+    except Exception as e:
+        print(f"Compression request error: {e}")
+        await callback_query.edit_message_text(f"❌ Error starting compression: {str(e)}")
 
-async def show_video_info(callback_query: CallbackQuery, data: str):
+async def start_compression(client: Client, task_id: str, message, task_data: dict):
+    """Start video compression"""
+    try:
+        # Update status to processing
+        await db.update_compression_task(task_id, {'status': 'processing', 'progress': 0})
+        
+        # Download the file
+        await db.update_compression_task(task_id, {'progress': 10})
+        
+        # Get file
+        if message.video:
+            file_obj = message.video
+        else:
+            file_obj = message.document
+        
+        # Create downloads directory
+        download_dir = Config.DOWNLOAD_DIR
+        os.makedirs(download_dir, exist_ok=True)
+        
+        # Download file
+        input_path = os.path.join(download_dir, f"input_{task_id}_{task_data['file_name']}")
+        await message.download(input_path)
+        
+        await db.update_compression_task(task_id, {'progress': 30})
+        
+        # Compress video
+        output_path = os.path.join(download_dir, f"compressed_{task_id}_{task_data['file_name']}")
+        
+        success = await compressor.compress_video(
+            input_path=input_path,
+            output_path=output_path,
+            settings=task_data['settings'],
+            progress_callback=lambda p: asyncio.create_task(
+                db.update_compression_task(task_id, {'progress': 30 + int(p * 0.6)})
+            )
+        )
+        
+        if not success:
+            await db.update_compression_task(task_id, {'status': 'failed'})
+            await client.send_message(
+                task_data['user_id'],
+                f"❌ **Compression Failed!**\n\nTask ID: `{task_id}`"
+            )
+            return
+        
+        await db.update_compression_task(task_id, {'progress': 90})
+        
+        # Upload compressed video
+        try:
+            # Get file sizes
+            original_size = os.path.getsize(input_path)
+            compressed_size = os.path.getsize(output_path)
+            size_saved = original_size - compressed_size
+            
+            # Send compressed video
+            caption = f"""
+✅ **Video Compressed Successfully!**
+
+**Original Size:** `{format_bytes(original_size)}`
+**Compressed Size:** `{format_bytes(compressed_size)}`
+**Size Saved:** `{format_bytes(size_saved)}` ({size_saved/original_size*100:.1f}%)
+
+**Settings Used:**
+**Preset:** `{task_data['settings'].get('preset', 'medium')}`
+**Resolution:** `{task_data['settings'].get('resolution', 'keep')}`
+"""
+            
+            await client.send_video(
+                chat_id=task_data['user_id'],
+                video=output_path,
+                caption=caption,
+                supports_streaming=True
+            )
+            
+            # Upload to dump channel if configured
+            if hasattr(Config, 'DUMP_ID') and Config.DUMP_ID:
+                try:
+                    await client.send_video(
+                        chat_id=Config.DUMP_ID,
+                        video=output_path,
+                        caption=f"Compressed by User {task_data['user_id']}\n{caption}"
+                    )
+                except:
+                    pass
+            
+            # Update database
+            await db.update_compression_task(task_id, {'status': 'completed', 'progress': 100})
+            await db.update_user_stats(task_data['user_id'], size_saved)
+            
+            # Clean up files
+            try:
+                os.remove(input_path)
+                os.remove(output_path)
+            except:
+                pass
+                
+        except Exception as e:
+            print(f"Upload error: {e}")
+            await db.update_compression_task(task_id, {'status': 'failed'})
+            await client.send_message(
+                task_data['user_id'],
+                f"❌ **Upload Failed!**\n\nTask ID: `{task_id}`\nError: {str(e)}"
+            )
+            
+    except Exception as e:
+        print(f"Compression error: {e}")
+        await db.update_compression_task(task_id, {'status': 'failed'})
+        await client.send_message(
+            task_data['user_id'],
+            f"❌ **Compression Failed!**\n\nTask ID: `{task_id}`\nError: {str(e)}"
+        )
+        
+        # Clean up files
+        try:
+            if 'input_path' in locals():
+                os.remove(input_path)
+            if 'output_path' in locals():
+                os.remove(output_path)
+        except:
+            pass
+
+async def show_video_info(client: Client, callback_query: CallbackQuery, data: str):
     """Show video information"""
-    await callback_query.answer("📊 Getting video info...")
-    # Add your video info logic here
+    try:
+        message_id = int(data.replace("video_info_", ""))
+        
+        # Get the original message
+        original_message = await client.get_messages(
+            callback_query.message.chat.id, 
+            message_id
+        )
+        
+        if original_message.video:
+            file_obj = original_message.video
+            file_type = "Video"
+        elif original_message.document:
+            file_obj = original_message.document
+            file_type = "Document"
+        else:
+            await callback_query.answer("❌ File not found")
+            return
+        
+        info_text = f"""
+📊 **{file_type} Information:**
+
+**Name:** `{file_obj.file_name or 'Unknown'}`
+**Size:** `{format_bytes(file_obj.file_size)}`
+**MIME Type:** `{getattr(file_obj, 'mime_type', 'Unknown')}`
+"""
+        
+        if hasattr(file_obj, 'duration') and file_obj.duration:
+            info_text += f"**Duration:** `{file_obj.duration}s`\n"
+        
+        if hasattr(file_obj, 'width') and hasattr(file_obj, 'height'):
+            info_text += f"**Resolution:** `{file_obj.width}x{file_obj.height}`\n"
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚀 Quick Compress", 
+                                callback_data=f"compress_quick_{message_id}")],
+            [InlineKeyboardButton("⚙️ Custom Settings", 
+                                callback_data=f"compress_custom_{message_id}")],
+            [InlineKeyboardButton("🔙 Back", callback_data="start")]
+        ])
+        
+        await callback_query.edit_message_text(info_text, reply_markup=keyboard)
+        
+    except Exception as e:
+        print(f"Video info error: {e}")
+        await callback_query.answer("❌ Error getting video info")
+
+# Create the handler
+handle_callback = CallbackQueryHandler(handle_callback, auth_user)
